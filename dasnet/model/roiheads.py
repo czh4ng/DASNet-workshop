@@ -812,69 +812,82 @@ def expand_gt_and_attention_masks(gt_masks, attention_masks, image_shapes):
     return expanded_gt_masks, expanded_attention_masks
     
 
-def calculate_expansion_scale(original_shapes, expanded_shapes):
+def calculate_expansion_scale(original_shapes, expanded_shapes, expand_vertical=True):
     """
-    Calculate the horizontal expansion scale for each image.
-    :param original_shapes: List[Tuple[int, int]], original image dimensions (H_img, W_img).
-    :param expanded_shapes: List[Tuple[int, int]], expanded image dimensions (H_exp, W_exp).
-    :return: List[float], expansion scales for each image.
+    Calculate the expansion scale for each image (for the dimension that was expanded).
+    :param original_shapes: List[Tuple[int, int]], original (H_img, W_img). DAS: H=time, W=channel.
+    :param expanded_shapes: List[Tuple[int, int]], expanded (H_exp, W_exp).
+    :param expand_vertical: If True, we expanded H (time) -> return scale_y = H_exp/H_orig.
+    :return: List[float], expansion scales per image.
     """
     scales = []
     for (H_orig, W_orig), (H_exp, W_exp) in zip(original_shapes, expanded_shapes):
-        scale_x = W_exp / W_orig
-        scales.append(scale_x)
+        if expand_vertical:
+            scales.append(H_exp / H_orig)
+        else:
+            scales.append(W_exp / W_orig)
     return scales
 
 
-def expand_image_shapes_fixed(image_shapes, alpha=1.0):
+def expand_image_shapes_fixed(image_shapes, alpha=1.0, use_space_to_expand_time=True):
     """
-    Expand image_shapes by a fixed length in the horizontal direction based on vertical length * alpha.
-    :param image_shapes: List[Tuple[int, int]], original image dimensions (H_img, W_img).
-    :param alpha: Width = height * alpha for expansion.
+    Expand image_shapes for mask ROI. DAS convention: (H_img, W_img) = (time, channel).
+    :param image_shapes: List[Tuple[int, int]], (H_img, W_img).
+    :param alpha: scale factor.
+    :param use_space_to_expand_time: If True, expand time by channel scale: additional_height = W_img * alpha.
     :return: Expanded image_shapes.
     """
     expanded_image_shapes = []
     for H_img, W_img in image_shapes:
-        # Compute the additional width based on height
-        additional_width = int(H_img * alpha)
-        # Update width
-        expanded_width = W_img + additional_width
-        expanded_image_shapes.append((H_img, expanded_width))
+        if use_space_to_expand_time:
+            # time dim expanded by channel (space) width
+            additional_height = int(W_img * alpha)
+            expanded_height = H_img + additional_height
+            expanded_image_shapes.append((expanded_height, W_img))
+        else:
+            additional_width = int(H_img * alpha)
+            expanded_width = W_img + additional_width
+            expanded_image_shapes.append((H_img, expanded_width))
     return expanded_image_shapes
 
 
-def expand_features(features, scales):
+def expand_features(features, scales, expand_vertical=True):
     """
-    Expand features for each image based on its individual horizontal expansion scale.
-    :param features: OrderedDict[str, Tensor], feature maps for different layers (e.g., P2, P3, etc.).
-    :param scales: List[List[float]], outer list for batch, inner list for layers (scales for each image and each layer).
-    :return: OrderedDict[str, Tensor], expanded feature maps.
+    Expand features for each image. DAS: feature (B, C, H_feat, W_feat) with H=time, W=channel.
+    :param expand_vertical: If True, expand H (time) dimension; else expand W (channel).
     """
     expanded_features = OrderedDict()
 
     for level_name, feature_map in features.items():
         B, C, H_feat, W_feat = feature_map.shape
-
-        # initialize expanded_features
         expanded_feature_maps = []
 
-        for b in range(B):  # batch
-            scale_x = scales[b]  # apply expansion_scale
-            expanded_width = int(W_feat * scale_x)
-
-            # no expanded
-            if expanded_width <= W_feat:
-                expanded_feature_maps.append(feature_map[b:b + 1])
-                continue
-
-            # expanded
-            padding_width = expanded_width - W_feat
-            expanded_map = torch.nn.functional.pad(
-                feature_map[b:b + 1],
-                (0, padding_width, 0, 0),  # (left, right, top, bottom)
-                mode="constant",
-                value=0
-            )
+        for b in range(B):
+            scale = scales[b]
+            if expand_vertical:
+                expanded_size = int(H_feat * scale)
+                if expanded_size <= H_feat:
+                    expanded_feature_maps.append(feature_map[b:b + 1])
+                    continue
+                padding_height = expanded_size - H_feat
+                expanded_map = torch.nn.functional.pad(
+                    feature_map[b:b + 1],
+                    (0, 0, 0, padding_height),  # (left, right, top, bottom)
+                    mode="constant",
+                    value=0
+                )
+            else:
+                expanded_size = int(W_feat * scale)
+                if expanded_size <= W_feat:
+                    expanded_feature_maps.append(feature_map[b:b + 1])
+                    continue
+                padding_width = expanded_size - W_feat
+                expanded_map = torch.nn.functional.pad(
+                    feature_map[b:b + 1],
+                    (0, padding_width, 0, 0),
+                    mode="constant",
+                    value=0
+                )
             expanded_feature_maps.append(expanded_map)
 
         expanded_features[level_name] = torch.cat(expanded_feature_maps, dim=0)
@@ -882,35 +895,35 @@ def expand_features(features, scales):
     return expanded_features
 
 
-def crop_mask_proposals_and_expand(mask_proposals, image_shapes, alpha=1.0, enable_crop=True):
+def crop_mask_proposals_and_expand(mask_proposals, image_shapes, alpha=1.0, enable_crop=True, use_space_to_crop_time=True):
     """
-    Crop proposals and expand image_shapes based on a fixed horizontal length.
-    :param features: Tensor of shape (B, C, H_feat, W_feat), feature maps.
-    :param mask_proposals: List[Tensor], each Tensor of shape (N, 4), proposals in [x_min, y_min, x_max, y_max].
-    :param image_shapes: List[Tuple[int, int]], original image dimensions.
-    :param alpha: Width = height * alpha for cropping.
-    :return: Cropped mask_proposals and expanded image_shapes.
+    Crop mask proposals and expand image_shapes. Box: [x_min, y_min, x_max, y_max] with x=channel, y=time (DAS).
+    :param alpha: scale factor.
+    :param use_space_to_crop_time: If True, time crop by channel (space) extent: new_height = width * alpha.
     """
     if (not enable_crop) or (alpha is None):
         return mask_proposals, image_shapes
 
-    # Step 1: Expand image shapes
-    expanded_image_shapes = expand_image_shapes_fixed(image_shapes, alpha)
+    expanded_image_shapes = expand_image_shapes_fixed(image_shapes, alpha, use_space_to_expand_time=use_space_to_crop_time)
 
-    # Step 2: Crop proposals
     cropped_proposals = []
     for proposal in mask_proposals:
         x_min, y_min, x_max, y_max = proposal.unbind(dim=1)
-        height = y_max - y_min
-        new_width = alpha * height
-        x_max_cropped = x_min + new_width
-
-        # Clamp x_max_cropped to match the new image width
-        max_width = max(W_exp for _, W_exp in expanded_image_shapes)
-        x_max_cropped = torch.clamp(x_max_cropped, max=max_width)
-
-        # Reassemble cropped proposals
-        cropped_proposal = torch.stack([x_min, y_min, x_max_cropped, y_max], dim=1)
+        if use_space_to_crop_time:
+            # time crop length from channel (space) width
+            width = x_max - x_min
+            new_height = alpha * width
+            y_max_cropped = y_min + new_height
+            max_height = max(H_exp for H_exp, _ in expanded_image_shapes)
+            y_max_cropped = torch.clamp(y_max_cropped, max=max_height)
+            cropped_proposal = torch.stack([x_min, y_min, x_max, y_max_cropped], dim=1)
+        else:
+            height = y_max - y_min
+            new_width = alpha * height
+            x_max_cropped = x_min + new_width
+            max_width = max(W_exp for _, W_exp in expanded_image_shapes)
+            x_max_cropped = torch.clamp(x_max_cropped, max=max_width)
+            cropped_proposal = torch.stack([x_min, y_min, x_max_cropped, y_max], dim=1)
         cropped_proposals.append(cropped_proposal)
 
     return cropped_proposals, expanded_image_shapes
@@ -1241,10 +1254,12 @@ class RoIHeads(nn.Module):
             if self.mask_roi_pool is not None:
                 original_img_shapes = image_shapes
                 crop_alpha = (self.v_ref * self.time_step) / self.spacing
-                mask_proposals, image_shapes = crop_mask_proposals_and_expand(mask_proposals, image_shapes, alpha=crop_alpha, enable_crop=self.enable_crop)
-                
-                scales = calculate_expansion_scale(original_img_shapes, image_shapes)
-                features = expand_features(features, scales)
+                # time crop and expand by channel (space) scale
+                mask_proposals, image_shapes = crop_mask_proposals_and_expand(
+                    mask_proposals, image_shapes, alpha=crop_alpha, enable_crop=self.enable_crop, use_space_to_crop_time=True
+                )
+                scales = calculate_expansion_scale(original_img_shapes, image_shapes, expand_vertical=True)
+                features = expand_features(features, scales, expand_vertical=True)
 
                 mask_features = self.mask_roi_pool(features, mask_proposals, image_shapes)
                 mask_features = self.mask_head(mask_features)
