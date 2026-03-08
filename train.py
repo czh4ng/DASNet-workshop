@@ -32,11 +32,11 @@ allowed_bins = {
 }
 
 min_keep_bins = {
-    1: 3,
-    2: 3,
-    3: 2,
+    1: -1,
+    2: -1,
+    3: -1,
     4: -1,
-    5: 3,
+    5: -1,
     6: -1,
     7: -1,
     8: -1,
@@ -45,92 +45,238 @@ min_keep_bins = {
 }
 
 @torch.no_grad()
-def visualize_dasnet_batch(model, images, targets, args, epoch, batch_idx, max_samples=1, dt=0.01, dx=5.1*2):
-    """
-    plot train: 3-channel data + label(bbox/mask/class) + predictions
-    """
-    if not utils.is_main_process():
-        return
+def visualize_dasnet_batch(
+    model,
+    images,
+    targets,
+    args,
+    epoch,
+    batch_idx,
+    max_samples=1,
+    dt=0.01,
+    dx=5.1 * 2,
+):
 
-    model.eval()
+    if not utils.is_main_process():
+        return []
+
     os.makedirs(args.figure_dir, exist_ok=True)
 
+    model.eval()
     num_show = min(len(images), max_samples)
     outputs = model(images[:num_show])
     model.train()
+
     saved_paths = []
 
     for i in range(num_show):
-        img = images[i].detach().cpu().permute(1, 2, 0).numpy()  # (H,W,3)
+
+        # images[i]: (C, W, H) = (3, time, channel)
+        # display (H, W, 3) = (time, channel, 3)
+        img = images[i].detach().cpu().permute(1, 2, 0).numpy()
         H, W, _ = img.shape
+
         extent = (0, W * dt, 0, H * dx / 1e3)
 
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-        titles = ["Channel 1", "Channel 2", "Channel 3", "Targets vs Predictions"]
+        # 3 channels + GT + Pred = 5 panels
+        fig, axes = plt.subplots(1, 5, figsize=(20, 10))
+        titles = ["Channel 1", "Channel 2", "Channel 3", "GT", "Pred"]
 
+        # --------------------------------------------------
+        # 3-channel background
+        # --------------------------------------------------
         for c in range(3):
             ax = axes[c]
-            vstd = np.std(img[:, :, c]) * 2
-            ax.imshow(img[:, :, c] - np.mean(img[:, :, c]), cmap="seismic",
-                      vmin=-vstd, vmax=vstd, extent=extent, aspect="auto", origin='lower')
+            vstd = np.std(img[:, :, c]) * 2 + 1e-12
+            ax.imshow(
+                img[:, :, c] - np.mean(img[:, :, c]),
+                cmap="seismic",
+                vmin=-vstd,
+                vmax=vstd,
+                extent=extent,
+                aspect="auto",
+                origin="lower",
+            )
             ax.set_title(titles[c])
             ax.set_xlabel("Time (s)")
             ax.set_ylabel("Distance (km)")
 
-        ax = axes[3]
-        ax.imshow(np.mean(img, axis=2) - np.mean(img), cmap="gray",
-                  extent=extent, aspect="auto", alpha=0.6, origin='lower')
-        ax.set_title(titles[3])
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Distance (km)")
+        # shared base: mean of 3 channels
+        base = np.mean(img, axis=2)
+        vstd = np.std(base) * 2 + 1e-12
+
+        # ==================== GT Panel ====================
+        ax_gt = axes[3]
+        ax_gt.imshow(
+            base - np.mean(base),
+            cmap="seismic",
+            vmin=-vstd,
+            vmax=vstd,
+            extent=extent,
+            aspect="auto",
+            origin="lower",
+        )
+        ax_gt.set_title(titles[3])
+        ax_gt.set_xlabel("Distance (km)")
+        ax_gt.set_ylabel("Time (s)")
+
+        # =================== Pred Panel ===================
+        ax_pred = axes[4]
+        ax_pred.imshow(
+            base - np.mean(base),
+            cmap="seismic",
+            vmin=-vstd,
+            vmax=vstd,
+            extent=extent,
+            aspect="auto",
+            origin="lower",
+        )
+        ax_pred.set_title(titles[4])
+        ax_pred.set_xlabel("Distance (km)")
+        ax_pred.set_ylabel("Time (s)")
+
+        # ==================================================
+        # ==================== GT ==========================
+        # ==================================================
         if "boxes" in targets[i]:
-            boxes = targets[i]["boxes"].cpu().numpy()
-            labels = targets[i].get("labels", torch.zeros(len(boxes))).cpu().numpy()
+
+            boxes = targets[i]["boxes"].detach().cpu().numpy()
+            labels = targets[i].get("labels", torch.zeros(len(boxes))).detach().cpu().numpy()
             masks = targets[i].get("masks", None)
             att_masks = targets[i].get("attention_masks", None)
+
             for j, box in enumerate(boxes):
-                x1, y1, x2, y2 = box
-                rect = patches.Rectangle((x1*dx/1e3, y1*dt),
-                                         (x2-x1)*dx/1e3, (y2-y1)*dt,
-                                         linewidth=1.5, edgecolor='lime', facecolor='none')
-                ax.add_patch(rect)
-                ax.text(x1*dx/1e3, y1*dt - 0.02, f"GT:{int(labels[j])}", color='lime', fontsize=7, weight='bold')
+
+                x1, y1, x2, y2 = box.astype(int)
+
+                # ---- bbox ----
+                rect = patches.Rectangle(
+                    (x1 * dt, y1 * dx / 1e3),
+                    (x2 - x1) * dt,
+                    (y2 - y1) * dx / 1e3,
+                    linewidth=1.5,
+                    edgecolor="lime",
+                    facecolor="none",
+                )
+                ax_gt.add_patch(rect)
+
+                ax_gt.text(
+                    x1 * dt,
+                    y1 * dx / 1e3,
+                    f"GT:{int(labels[j])}",
+                    color="lime",
+                    fontsize=7,
+                    weight="bold",
+                )
+
+                # ---- GT mask ----
                 if masks is not None:
-                    mask = masks[j].cpu().numpy()
-                    ax.contour(mask, colors='lime', alpha=0.4,
-                               levels=[0.5], extent=extent, linewidths=1.0)
+                    mask = masks[j].detach().cpu().numpy() / 255.0
+                    mask = np.squeeze(mask)
 
+                    alpha = np.zeros_like(mask)
+                    alpha[mask > 0.2] = 0.5
+
+                    rgba = plt.get_cmap("jet")(mask)
+                    rgba[..., 3] = alpha
+
+                    ax_gt.imshow(
+                        rgba,
+                        extent=extent,
+                        aspect="auto",
+                        origin="lower",
+                    )
+
+                # ---- attention mask ----
                 if att_masks is not None:
-                    att_mask = att_masks[j].cpu().numpy()
-                    ax.contour(att_mask, colors='yellow', alpha=0.4,
-                               levels=[0.5], extent=extent, linewidths=1.0)
+                    att_mask = att_masks[j].detach().cpu().numpy()
+                    att_mask = np.squeeze(att_mask)
 
+                    if att_mask.shape == (H, W):
+                        a = att_mask.astype(np.float32)
+                        if a.max() > 1.0:
+                            a = a / a.max()
 
+                        alpha = np.zeros_like(a, dtype=np.float32)
+                        alpha[a > 0.5] = 0.3
+
+                        rgba = np.zeros(a.shape + (4,), dtype=np.float32)
+                        rgba[..., 0] = 1.0  # R
+                        rgba[..., 1] = 1.0  # G
+                        rgba[..., 2] = 0.0  # B
+                        rgba[..., 3] = alpha
+
+                        ax_gt.imshow(
+                            rgba,
+                            extent=extent,
+                            aspect="auto",
+                            origin="lower",
+                        )
+
+        # ==================================================
+        # ================= Prediction =====================
+        # ==================================================
         pred = outputs[i]
+
         if "boxes" in pred:
+
             pboxes = pred["boxes"].detach().cpu().numpy()
-            plabels = pred.get("labels", torch.zeros(len(pboxes))).cpu().numpy()
-            pscores = pred.get("scores", torch.zeros(len(pboxes))).cpu().numpy()
+            plabels = pred.get("labels", torch.zeros(len(pboxes))).detach().cpu().numpy()
+            pscores = pred.get("scores", torch.zeros(len(pboxes))).detach().cpu().numpy()
             pmasks = pred.get("masks", None)
 
             for j, box in enumerate(pboxes):
+
                 if pscores[j] < 0.5:
                     continue
-                x1, y1, x2, y2 = box
-                rect = patches.Rectangle((x1*dx/1e3, y1*dt),
-                                         (x2-x1)*dx/1e3, (y2-y1)*dt,
-                                         linewidth=1.2, edgecolor='red', facecolor='none')
-                ax.add_patch(rect)
-                ax.text(x1*dx/1e3, y2*dt - 0.02,
-                        f"P:{int(plabels[j])} ({pscores[j]:.2f})",
-                        color='red', fontsize=7, weight='bold')
+
+                x1, y1, x2, y2 = box.astype(int)
+
+                rect = patches.Rectangle(
+                    (x1 * dt, y1 * dx / 1e3),
+                    (x2 - x1) * dt,
+                    (y2 - y1) * dx / 1e3,
+                    linewidth=1.2,
+                    edgecolor="red",
+                    facecolor="none",
+                )
+                ax_pred.add_patch(rect)
+
+                ax_pred.text(
+                    x1 * dt,
+                    y2 * dx / 1e3,
+                    f"P:{int(plabels[j])} ({pscores[j]:.2f})",
+                    color="red",
+                    fontsize=7,
+                    weight="bold",
+                )
+
+                # ---- pred mask ----
                 if pmasks is not None:
-                    mask = pmasks[j, 0].detach().cpu().numpy()
-                    ax.contour(mask, colors='red', alpha=0.5,
-                               levels=[0.5], extent=extent, linewidths=1.0)
+                    mask = pmasks[j].detach().cpu().numpy()
+                    mask = np.squeeze(mask)
+
+                    mask = np.clip(mask, 0, 1)
+                    alpha = np.zeros_like(mask)
+                    alpha[mask > 0.2] = 0.5
+
+                    rgba = plt.get_cmap("jet")(mask)
+                    rgba[..., 3] = alpha
+
+                    ax_pred.imshow(
+                        rgba,
+                        extent=extent,
+                        aspect="auto",
+                        origin="lower",
+                    )
 
         fig.tight_layout()
-        save_path = os.path.join(args.figure_dir, f"epoch{epoch:02d}_batch{batch_idx:04d}_sample{i:02d}.png")
+
+        save_path = os.path.join(
+            args.figure_dir,
+            f"epoch{epoch:02d}_batch{batch_idx:04d}_sample{i:02d}.png",
+        )
+
         fig.savefig(save_path, dpi=250, bbox_inches="tight")
         plt.close(fig)
 
@@ -140,51 +286,6 @@ def visualize_dasnet_batch(model, images, targets, args, epoch, batch_idx, max_s
 
 
 logger = logging.getLogger("DASNet")
-
-# def evaluate(model, data_loader, scaler, args, epoch=0, total_samples=1):
-#     model.train()
-#     metric_logger = utils.MetricLogger(delimiter="  ")
-#     metric_logger.add_meter("loss", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
-
-#     loss_keys = ['loss_classifier', 'loss_box_reg', 'loss_mask', 'loss_objectness', 'loss_rpn_box_reg']
-#     for key in loss_keys:
-#         metric_logger.add_meter(key, utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
-
-#     header = "Eval:"
-#     processed_samples = 0
-
-#     with torch.inference_mode():
-#         for images, targets in metric_logger.log_every(data_loader, args.print_freq, header):
-#             images = [img.to(args.device) for img in images]
-#             targets = [{k: v.to(args.device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
-
-#             loss_dict = model(images, targets)
-#             losses = sum(loss for loss in loss_dict.values())
-
-#             batch_size = len(images)
-#             metric_logger.update(loss=losses.item())
-
-#             for key in loss_keys:
-#                 if key in loss_dict:
-#                     metric_logger.update(**{key: loss_dict[key].item()})
-
-#             processed_samples += batch_size
-#             if processed_samples >= total_samples:
-#                 break
-
-#     metric_logger.synchronize_between_processes()
-#     print(f"Test Loss: {metric_logger.loss.global_avg:.6f}")
-
-#     if args.wandb and utils.is_main_process():
-#         wandb.log({
-#             "test/loss": metric_logger.loss.global_avg,
-#             "test/epoch": epoch,
-#             **{f"test/{key}": metric_logger.meters[key].global_avg for key in loss_keys if key in metric_logger.meters}
-#         })
-
-#     del images, targets, loss_dict
-
-#     return metric_logger
 def evaluate(model, data_loader, scaler, args, epoch=0, total_samples=1, save_last_k=3):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -494,7 +595,7 @@ def main(args):
     if args.resume:
         if args.checkpoint and os.path.exists(args.checkpoint):
             print(f"Loading checkpoint from {args.checkpoint}")
-            checkpoint = torch.load(args.checkpoint, map_location="cpu")
+            checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
             model_without_ddp.load_state_dict(checkpoint["model"])
             optimizer.load_state_dict(checkpoint["optimizer"])
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
@@ -503,7 +604,8 @@ def main(args):
 
     # initialize WandB
     if args.wandb and utils.is_main_process():
-        wandb.init(project="DASNet", config=vars(args))
+        os.makedirs(args.wandb_dir, exist_ok=True)
+        wandb.init(project="DASNet", name=args.wandb_name, config=vars(args), dir=args.wandb_dir)
         wandb.watch(model, log="all", log_freq=args.print_freq)
 
     # training loop
@@ -613,6 +715,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--wandb", action="store_true", help="Enable WandB logging")
     parser.add_argument("--wandb-project", default="DASNet", type=str, help="WandB project name")
     parser.add_argument("--wandb-name", default=None, type=str, help="WandB run name")
+    parser.add_argument("--wandb-dir", default="./wandb", type=str, help="WandB local save directory")
 
     # Checkpointing
     parser.add_argument("--output-dir", default="./output", type=str, help="Directory to save model checkpoints")
@@ -626,6 +729,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--sync-bn", action="store_true", help="Use synchronized batch normalization")
     parser.add_argument("--world-size", default=1, type=int, help="Number of distributed training processes")
     parser.add_argument("--dist-url", default="env://", type=str, help="URL used for setting up distributed training")
+    parser.add_argument("--dist-timeout-minutes", default=120, type=int, help="NCCL collective timeout in minutes (default 120)")
 
     parser.add_argument(
         "--use-deterministic-algorithms", action="store_true", help="Forces the use of deterministic algorithms only."
