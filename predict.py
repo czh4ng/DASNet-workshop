@@ -4,13 +4,12 @@ import torch.nn.functional as F
 import pandas as pd
 from tqdm import tqdm
 from contextlib import nullcontext
-import csv
 from collections import defaultdict
 import numpy as np
 from scipy.ndimage import gaussian_filter
 import utils
 import json
-from dasnet.data.continuous_dataset import DASNet__ContinuousDataset
+from dasnet.data.das import DASInferDataset
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -34,19 +33,28 @@ label_map = {
 }
 logger = logging.getLogger()
 
-def get_files(data_list):
-    if data_list == '':
+def get_files(data_list: str):
+    """
+    return hdf5 file list for prediction
+
+    - if data_list is empty:
+        auto dectect files from SeaFOAM das data
+    - data_list is not empty:
+            - it should include "path"
+        return this path as list[str]
+    """
+    if data_list == "":
         if utils.is_main_process():
-            print("Searching files ...")
-        # GCS Key path
+            print("Searching files from GCS ...")
+
         default_key_path = "./test_skypilot/x-berkeley-mbari-das-8c2333fca1b2.json"
         fs = fsspec.filesystem("gcs", token=default_key_path)
 
-        # hdf5 file name
-        hdf5_files = []
+        hdf5_files: list[str] = []
         folders = fs.ls("berkeley-mbari-das/")
         for folder in folders:
-            if folder.split("/")[-1] in ["ContextData", "MBARI_cable_geom_dx10m.csv"]:
+            name = folder.split("/")[-1]
+            if name in ["ContextData", "MBARI_cable_geom_dx10m.csv"]:
                 continue
             years = fs.ls(folder)
             for year in years:
@@ -54,16 +62,19 @@ def get_files(data_list):
                 for jday in jdays:
                     files = fs.ls(jday)
                     for file in files:
-                        if file.endswith(".h5") and os.path.basename(file).startswith("MBARI_F8_STU_GL20m_OCP5m_FS200Hz_2023-11-0"): #MBARI_F8_STU_GL20m_OCP5m_FS200Hz_2024-12-3
+                        if file.endswith(".h5"):
                             hdf5_files.append(file)
         if utils.is_main_process():
-            print(f'Total file number: {len(hdf5_files)}')
-    else:
-        hdf5_files = pd.read_csv(args.data_list)
-        if utils.is_main_process():
-            print(f'Total file number: {len(hdf5_files)}')
+            print(f"Total file number from GCS: {len(hdf5_files)}")
+        return hdf5_files
 
-    return hdf5_files
+    df = pd.read_csv(data_list)
+    if "path" not in df.columns:
+        raise KeyError(f'"path" column not found in {data_list}. Columns={list(df.columns)}')
+    paths = df["path"].astype(str).tolist()
+    if utils.is_main_process():
+        print(f"Total file number from list: {len(paths)}")
+    return paths
         
 
 def extract_peak_points(matrix, x_range, y_range, threshold=0.5, sigma=5, is_filt=True, is_gauss=True):
@@ -162,12 +173,19 @@ def mask_agnostic_nms_single_image(
 
 
 def postprocess_dasnet(filenames, output, alpha=(1000 / 200) / 5.1):
-    """Post-process the DASNet model output, handling mask cropping."""
-    batch_size = len(filenames)
+    """
+    Post-process DASNet mask output to full image. Matches roi_heads: time extent is
+    defined by channel (space) width: time_target = alpha * channel_width.
 
+    Flow: (1) Crop mask to box region on full-image mask.
+          (2) Resize cropped patch in time dimension to time_target = alpha * channel_width.
+          (3) Paste back into box; if resized height exceeds image bottom, keep front part only.
+
+    Convention: box [x_min, y_min, x_max, y_max] = (channel, time); mask (N, 1, H, W) with H=time, W=channel.
+    """
+    batch_size = len(filenames)
     results = []
 
-    # second nms to remove different categories overlapped instances
     output = [mask_agnostic_nms_single_image(out) for out in output]
 
     for i in range(batch_size):
@@ -177,44 +195,80 @@ def postprocess_dasnet(filenames, output, alpha=(1000 / 200) / 5.1):
             "labels": output[i]["labels"].detach().cpu().numpy(),
         }
 
-        # orignal data shape
-        masks = output[i]['masks']
+        masks = output[i]["masks"]
         H_img, W_img = masks.shape[-2:]
 
-        # handling mask
         boxes = output[i]["boxes"]
-        masks = output[i]["masks"]  # (N, 1, H_crop, W_crop)
+        masks = output[i]["masks"]
 
         final_masks = torch.zeros((len(masks), H_img, W_img), device=masks.device)
 
         for j, (box, mask) in enumerate(zip(boxes, masks)):
             x_min, y_min, x_max, y_max = box.int()
-            cropped_mask = mask[:, y_min:y_max, x_min:x_max]  # Crop mask to the box region
-
             height = y_max - y_min
-            cropped_width = int(height * alpha)
+            channel_width = x_max - x_min
+            if height < 1 or channel_width < 1:
+                continue
 
-            # resize mask
-            resized_mask = F.interpolate(
+            # 1) Crop box region from full-image mask
+            cropped_mask = mask[:, y_min:y_max, x_min:x_max]
+
+            # 2) Time extent from channel (space) width; do not clamp so we can "keep front" when pasting
+            time_target = int(float(channel_width) * alpha)
+            time_target = max(1, time_target)
+
+            # 3) Resize cropped mask in time dimension to (time_target, channel_width)
+            resized = F.interpolate(
                 cropped_mask.unsqueeze(0),
-                size=(height, cropped_width),
+                size=(time_target, channel_width),
                 mode="bilinear",
-                align_corners=False
-            ).squeeze(0)
+                align_corners=False,
+            )
+            # resized: (1, 1, time_target, channel_width)
 
-            full_box_mask = torch.zeros((height, x_max - x_min), device=masks.device)
-
-            # ensure resized_mask dimensions match full_box_mask
-            cropped_width = min(cropped_width, full_box_mask.shape[1])
-            resized_mask = resized_mask[:, :, :cropped_width]
-
-            full_box_mask[:, :cropped_width] = resized_mask
-            final_masks[j, y_min:y_max, x_min:x_max] = full_box_mask
+            # 4) Paste into image; if resized height exceeds image bottom, keep front part only
+            paste_height = min(time_target, H_img - y_min)
+            final_masks[j, y_min : y_min + paste_height, x_min:x_max] = resized[0, 0, :paste_height, :]
 
         result["masks"] = final_masks.cpu().numpy()
         results.append(result)
 
     return filenames, results
+
+
+def save_predictions_json(file_name, selected_results, peak_points_list, peak_scores_list, output_dir, resize_scale=0.5):
+    """
+    Save predictions to one JSON per input file. Box and picks are in original (real) scale:
+    model coordinates * (1 / resize_scale). Convention: x = channel, y = time.
+    """
+    scale_back = 1.0 / resize_scale
+    base_name = os.path.splitext(os.path.basename(file_name))[0]
+    instances = []
+    for j in range(len(selected_results["scores"])):
+        box = selected_results["boxes"][j]
+        box_real = [float(box[k]) * scale_back for k in range(4)]
+        score = float(selected_results["scores"][j])
+        label_id = int(selected_results["labels"][j])
+        label_name = label_map.get(label_id, str(label_id))
+        picks = peak_points_list[j] if j < len(peak_points_list) else []
+        pick_scores = peak_scores_list[j] if j < len(peak_scores_list) else []
+        picks_real = [[float(x) * scale_back, float(y) * scale_back] for x, y in picks]
+        instances.append({
+            "box": box_real,
+            "score": score,
+            "label": label_id,
+            "label_name": label_name,
+            "picks": picks_real,
+            "pick_scores": [float(s) for s in pick_scores],
+        })
+    out = {
+        "file_name": os.path.basename(file_name),
+        "resize_scale": resize_scale,
+        "instances": instances,
+    }
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, base_name + ".json"), "w") as f:
+        json.dump(out, f, indent=2)
 
 
 def save_to_labelme_format(file_name, selected_results, peak_points_list, peak_scores_list, output_dir):
@@ -326,88 +380,89 @@ def save_to_labelme_format(file_name, selected_results, peak_points_list, peak_s
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+
+
 def plot_das_predictions(input_data, predictions, save_path, score_threshold=0.8, mask_threshold=0.25):
-    fig, axes = plt.subplots(3, 1, figsize=(7*7/2*0.6, 3 * 7*7/8*0.6))
+    """
+    Plot prediction boxes and masks on DAS image.
+
+    Convention (aligned with das.py): image_data shape (W, H) = (time, channel);
+    box (x_min, y_min, x_max, y_max) has x=channel, y=time.
+    We display with x = time, y = channel: show image_data.T and map box to (time, channel).
+    """
+    fig, axes = plt.subplots(3, 1, figsize=(7 * 7 / 2 * 0.6, 3 * 7 * 7 / 8 * 0.6))
 
     for idx, ax in enumerate(axes):
+        # input_data[idx]: (W, H) = (time, channel) from model image (C, W, H)
         image_data = np.array(input_data[idx], dtype=np.float32)
-        # print(np.percentile(image_data, 90))
+        # Display x=time, y=channel -> show (channel, time) so imshow puts time on x-axis
+        display_img = image_data.T  # (H, W) = (channel, time)
+        n_channel, n_time = display_img.shape
+
         plt.sca(ax)
-        plt.imshow(np.flipud(image_data), cmap='seismic', vmin=np.percentile(image_data, 10), vmax=np.percentile(image_data, 90), rasterized=True)
+        vmin = np.percentile(display_img, 10)
+        vmax = np.percentile(display_img, 90)
+        ax.imshow(display_img, cmap="seismic", vmin=vmin, vmax=vmax, aspect="auto", origin="lower", rasterized=True)
 
-        boxes = predictions['boxes']
-        masks = predictions['masks']
-        labels = predictions['labels']
-        scores = predictions['scores']
-
-        H = image_data.shape[0]
+        boxes = predictions["boxes"]
+        masks = predictions["masks"]
+        labels = predictions["labels"]
+        scores = predictions["scores"]
 
         for box, score, label, mask in zip(boxes, scores, labels, masks):
-            if score > score_threshold:
-                x1, y1, x2, y2 = box
+            if score <= score_threshold:
+                continue
+            # box: (x_min, y_min, x_max, y_max) = (channel_min, time_min, channel_max, time_max)
+            x_min, y_min, x_max, y_max = box
+            # Display coords: x = time (y_min..y_max), y = channel (x_min..x_max)
+            rect = patches.Rectangle(
+                (float(y_min), float(x_min)),
+                float(y_max - y_min),
+                float(x_max - x_min),
+                linewidth=4,
+                edgecolor="r",
+                facecolor="none",
+            )
+            ax.add_patch(rect)
+            label_text = label_map.get(int(label), f"class {label}")
+            ax.text(float(y_min) + 40, float(x_max) - 20, f"{label_text}\n{score:.2f}", fontsize=10)
 
-                y1_flipped = H - y2
-                y2_flipped = H - y1
-                x1_flipped, x2_flipped = x1, x2
-                x1, y1, x2, y2 = x1_flipped, y1_flipped, x2_flipped, y2_flipped
+            # mask: (time, channel) = (H_img, W_img); for overlay on display (channel, time) use mask.T
+            mask_2d = np.squeeze(mask)
+            if mask_2d.ndim != 2:
+                continue
+            display_mask = mask_2d.T  # (channel, time)
 
-                rect = patches.Rectangle(
-                    (x1, y1), x2 - x1, y2 - y1,
-                    linewidth=4, edgecolor='r', facecolor='none'
-                )
-                ax.add_patch(rect)
+            alpha_mask = np.zeros_like(display_mask, dtype=np.float32)
+            if label in [2, 3, 8, 9]:
+                alpha_mask[display_mask > mask_threshold] = 0.5
+            jet_colormap = plt.get_cmap("jet")
+            rgba_mask = jet_colormap(display_mask)
+            rgba_mask[..., 3] = alpha_mask
+            ax.imshow(rgba_mask, aspect="auto", origin="lower")
 
-                label_text = label_map[label] if label in label_map else f'class {label}'
-                plt.text(x1 + 40, y2 - 150, f'{label_text}\n{score:.2f}', fontsize=10)
+            # extract_peak_points: mask (time, channel), returns (peak_x, peak_y) = (channel_idx, time_idx)
+            peak_points, _ = extract_peak_points(
+                mask_2d, [int(x_min), int(x_max)], [int(y_min), int(y_max)],
+                threshold=0.5, is_filt=False, is_gauss=True
+            )
+            if len(peak_points) > 0 and label in [2, 3, 8, 9]:
+                # display: x=time, y=channel -> scatter (time_idx, channel_idx)
+                for px, py in peak_points:
+                    ax.scatter(py, px, color="white", s=1)
 
-                mask = mask.squeeze()
-
-                smooth_mask = mask = np.flipud(mask)
-
-                alpha_mask = smooth_mask.copy()
-
-                if label in [2, 3, 8, 9]: # 4
-                    alpha_mask[alpha_mask <= mask_threshold] = 0
-                    alpha_mask[alpha_mask > mask_threshold] = 0.5
-                else:
-                    alpha_mask[:] = 0
-
-                jet_colormap = plt.get_cmap('jet')
-                rgba_mask = jet_colormap(smooth_mask)
-                rgba_mask[..., 3] = alpha_mask
-
-                ax.imshow(rgba_mask)
-
-                peak_points, _ = extract_peak_points(
-                    mask, [x1, x2], [y1, y2],
-                    threshold=0.5, is_filt=False, is_gauss=True
-                )
-
-                if len(peak_points) > 0 and label in [2, 3, 8, 9]: #4
-                    peak_x, peak_y = zip(*peak_points)
-                    plt.scatter(peak_x, peak_y, color='white', s=1)
-
-        plt.xlim(0, 6000)
-        plt.xticks([0, 1000, 2000, 3000, 4000, 5000, 6000],
-                   ["0", "10", "20", "30", "40", "50", "60"])
-
-        plt.ylim(0, 1422)
-        plt.yticks(
-            [1422-1300, 1422-1050, 1422-800, 1422-550, 1422-300, 1422-50],
-            ["10000", "9500", "9000", "8500", "8000", "7500"]
-        )
-        plt.ylabel("Channel number")
-
+        ax.set_xlim(0, n_time)
+        ax.set_ylim(0, n_channel)
+        ax.set_ylabel("Channel index")
         if idx == 2:
-            plt.xlabel("Time (s)")
-
+            ax.set_xlabel("Time (sample index)")
     plt.tight_layout()
-    plt.savefig(save_path, bbox_inches='tight')
+    plt.savefig(save_path, bbox_inches="tight")
     plt.close()
 
 
-def pred_dasnet(args, model, data_loader, pick_path, figure_path):
-    """Run inference on DASNet dataset using Mask R-CNN."""
+def pred_dasnet(args, model, data_loader, pick_path, figure_path, resize_scale=0.5):
+    """Run inference on DASNet dataset using Mask R-CNN. Results saved as JSON (box/picks in real scale)."""
     
     model.eval()
     ctx = nullcontext() if args.device == "cpu" else torch.amp.autocast(device_type=args.device, dtype=args.ptdtype)
@@ -438,44 +493,29 @@ def pred_dasnet(args, model, data_loader, pick_path, figure_path):
                     "labels": output[i]["labels"][keep_idx],
                 }
 
-                # empty file for no predictions
                 if len(selected_results["scores"]) == 0:
-                    # with open(os.path.join(pick_path, file_name + ".csv"), "a"):
-                    #     pass
                     continue
 
-                # save peak points instead of masks
                 peak_points_list = []
                 peak_points_values = []
                 for j in range(len(selected_results["scores"])):
-                    mask = selected_results["masks"][j]  # (1, H, W) -> (H, W)
+                    mask = selected_results["masks"][j]
                     x_min, y_min, x_max, y_max = selected_results["boxes"][j]
-                    x_range = (x_min, x_max)
-                    y_range = (y_min, y_max)
-
-                    peak_points, peak_point_values = extract_peak_points(mask, x_range, y_range, threshold=0.5, is_filt=False, is_gauss=True)
+                    peak_points, peak_point_values = extract_peak_points(
+                        mask, (x_min, x_max), (y_min, y_max), threshold=0.5, is_filt=False, is_gauss=True
+                    )
                     peak_points_list.append(peak_points)
                     peak_points_values.append(peak_point_values)
 
-                with open(os.path.join(pick_path, file_name + ".csv"), mode="w", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["x_min", "y_min", "x_max", "y_max", "score", "label", "peak_points", "peak_scores"])
-                    for j in range(len(selected_results["scores"])):
-                        box = selected_results["boxes"][j]
-                        score = selected_results["scores"][j]
-                        label = selected_results["labels"][j]
-                        peak_points = json.dumps(peak_points_list[j])
-                        peak_scores = json.dumps(peak_points_values[j])
-
-                        writer.writerow([box[0], box[1], box[2], box[3], score, label, peak_points, peak_scores])
-
-                save_to_labelme_format(file_name, selected_results, peak_points_list, peak_points_values, pick_path)
+                save_predictions_json(
+                    file_name, selected_results, peak_points_list, peak_points_values, pick_path, resize_scale
+                )
 
                 if args.plot_figure:
                     plot_das_predictions(
                         images[i].cpu().numpy(),
                         selected_results,
-                        os.path.join(figure_path, file_name + ".pdf"),
+                        os.path.join(figure_path, file_name + ".jpg"),
                         args.min_prob
                     )
 
@@ -515,22 +555,38 @@ def main(args):
     else:
         torch.backends.cudnn.benchmark = True
 
-    # if args.model in ["dasnet"]:...
-    dataset = DASNet__ContinuousDataset(
-        get_files(args.data_list),
-        key_path=args.key_path if hasattr(args, 'key_path') else None,
-        target_size=(1422, 6000),
-        pred_object=args.object,
-        channel_range=[3000, 5845]#[7400, 10245]
+    file_list = get_files(args.data_list)
+
+    if args.data_list == "":
+        storage_backend = "gcs"
+        gcs_key_path = args.key_path
+    else:
+        storage_backend = "auto"
+        gcs_key_path = args.key_path
+
+    dataset = DASInferDataset(
+        file_list,
+        resize_scale=0.5,
+        data_key="data",
+        data_is_strain_rate=True,
+        channel_range=None,
+        f_band=(2.0, 10.0),
+        f_high=10.0,
+        storage_backend=storage_backend,
+        gcs_key_path=gcs_key_path,
     )
+
     sampler = torch.utils.data.DistributedSampler(dataset) if args.distributed else None
+
+    def collate_fn(batch):
+        return tuple(zip(*batch))
 
     data_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         sampler=sampler,
         num_workers=min(args.workers, mp.cpu_count()),
-        collate_fn=None,
+        collate_fn=collate_fn,
         drop_last=False,
     )
 
@@ -569,7 +625,7 @@ def main(args):
         model = DDP(model, device_ids=[args.gpu])
 
     model.eval()
-    pred_dasnet(args, model, data_loader, result_path, figure_path)
+    pred_dasnet(args, model, data_loader, result_path, figure_path, resize_scale=dataset.resize_scale)
 
 import argparse
 def get_args_parser(add_help=True):
@@ -593,7 +649,7 @@ def get_args_parser(add_help=True):
 
     # **Data input**
     parser.add_argument("--data_list", type=str, default="", help="CSV file with the path of the input data")
-    parser.add_argument("--object", type=str, default="default", help="Specify target files for inference (default: all)")
+    parser.add_argument("--object", type=str, default="default", help="TODO: Specify target files for inference (default: all)")
     parser.add_argument("--key_path", type=str, default=None, help="Path to the GCS access key (if using Google Cloud data)")
 
     # **Prediction settings**
