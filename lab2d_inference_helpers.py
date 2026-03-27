@@ -68,7 +68,7 @@ def make_infer_dataloader(
     batch_size: int = 1,
     num_workers: int = 0,
     resize_scale: float = 0.5,
-    channel_range: Optional[Tuple[Optional[int], Optional[int]]] = (7401, None),
+    channel_range: Optional[Tuple[Optional[int], Optional[int]]] = None,
     storage_backend: str = "auto",
     gcs_key_path=None,
 ) -> Tuple[DataLoader, DASInferDataset]:
