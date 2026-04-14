@@ -9,7 +9,10 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-from pycocotools.coco import COCO
+try:
+    from pycocotools.coco import COCO
+except ImportError:
+    COCO = None
 from torchvision.transforms import functional as F
 from scipy.signal import butter, sosfiltfilt
 import fsspec
