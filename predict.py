@@ -456,8 +456,8 @@ def plot_das_predictions(input_data, predictions, save_path, score_threshold=0.8
         n_channel, n_time = display_img.shape
 
         plt.sca(ax)
-        vmin = np.percentile(display_img, 10)
-        vmax = np.percentile(display_img, 90)
+        vmin = np.percentile(display_img, 5)
+        vmax = np.percentile(display_img, 95)
         ax.imshow(display_img, cmap="seismic", vmin=vmin, vmax=vmax, aspect="auto", origin="lower", rasterized=True)
 
         boxes = predictions["boxes"]
@@ -513,7 +513,7 @@ def plot_das_predictions(input_data, predictions, save_path, score_threshold=0.8
         if idx == 2:
             ax.set_xlabel("Time (sample index)")
     plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
+    plt.savefig(save_path, bbox_inches="tight", dpi=600)
     plt.close()
 
 
